@@ -62,6 +62,58 @@ class APODNotAvailableError(Exception):
     pass
 
 
+def _stamp_file_times(path: Path, apod_date_str: str) -> None:
+    """
+    Set the file's atime and mtime to the APOD publication date.
+    On macOS, also sets the birthtime (creation date) via setattrlist.
+    """
+    apod_dt = datetime.strptime(apod_date_str, "%Y-%m-%d")
+    ts = apod_dt.timestamp()
+    os.utime(path, (ts, ts))
+
+    if sys.platform == 'darwin':
+        _macos_set_birthtime(path, ts)
+
+
+def _macos_set_birthtime(path: Path, timestamp: float) -> None:
+    """Set file birthtime on macOS via setattrlist(). Silently ignored on failure."""
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+        class _attrlist(ctypes.Structure):
+            _fields_ = [
+                ('bitmapcount', ctypes.c_ushort),
+                ('reserved',    ctypes.c_ushort),
+                ('commonattr',  ctypes.c_uint32),
+                ('volattr',     ctypes.c_uint32),
+                ('dirattr',     ctypes.c_uint32),
+                ('fileattr',    ctypes.c_uint32),
+                ('forkattr',    ctypes.c_uint32),
+            ]
+
+        class _timespec(ctypes.Structure):
+            _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+
+        ATTR_BIT_MAP_COUNT = 5
+        ATTR_CMN_CRTIME    = 0x00000200
+
+        attrs = _attrlist(bitmapcount=ATTR_BIT_MAP_COUNT, commonattr=ATTR_CMN_CRTIME)
+        buf   = _timespec(tv_sec=int(timestamp), tv_nsec=0)
+
+        libc.setattrlist(
+            str(path).encode(),
+            ctypes.byref(attrs),
+            ctypes.byref(buf),
+            ctypes.sizeof(buf),
+            ctypes.c_ulong(0),
+        )
+    except Exception:
+        pass  # best-effort; not critical
+
+
 def _format_summary(results):
     """Return a Rich-formatted download summary for a list of results."""
     successful = sum(1 for r in results if r['success'])
@@ -469,7 +521,9 @@ class APODDownloader:
                 img.close()
             except Exception:
                 pass
+            return filename  # return original if conversion/EXIF write failed
 
+        _stamp_file_times(final_path, apod_date_str)
         return final_path
 
     # ------------------------------------------------------------------

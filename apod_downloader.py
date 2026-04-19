@@ -64,19 +64,35 @@ class APODNotAvailableError(Exception):
 
 def _stamp_file_times(path: Path, apod_date_str: str) -> None:
     """
-    Set the file's atime and mtime to the APOD publication date.
-    On macOS, also sets the birthtime (creation date) via setattrlist.
+    Set the file's atime, mtime, and birthtime to the APOD publication date.
+
+    atime/mtime are set via os.utime() on all platforms. Birthtime is set
+    where the OS permits: macOS via setattrlist(), Windows via SetFileTime().
+    Linux does not expose a standard interface for setting birthtime, so only
+    atime/mtime are updated there.
     """
     apod_dt = datetime.strptime(apod_date_str, "%Y-%m-%d")
     ts = apod_dt.timestamp()
     os.utime(path, (ts, ts))
+    _set_birthtime(path, ts)
 
+
+def _set_birthtime(path: Path, timestamp: float) -> None:
+    """
+    Attempt to set the file creation date (birthtime). Silently ignored on failure.
+
+    macOS:   setattrlist() via ctypes
+    Windows: SetFileTime() via ctypes.windll
+    Linux:   no-op (birthtime is not writable via standard interfaces)
+    """
     if sys.platform == 'darwin':
-        _macos_set_birthtime(path, ts)
+        _set_birthtime_darwin(path, timestamp)
+    elif sys.platform == 'win32':
+        _set_birthtime_win32(path, timestamp)
 
 
-def _macos_set_birthtime(path: Path, timestamp: float) -> None:
-    """Set file birthtime on macOS via setattrlist(). Silently ignored on failure."""
+def _set_birthtime_darwin(path: Path, timestamp: float) -> None:
+    """Set birthtime on macOS via setattrlist()."""
     try:
         import ctypes
         import ctypes.util
@@ -111,7 +127,46 @@ def _macos_set_birthtime(path: Path, timestamp: float) -> None:
             ctypes.c_ulong(0),
         )
     except Exception:
-        pass  # best-effort; not critical
+        pass
+
+
+def _set_birthtime_win32(path: Path, timestamp: float) -> None:
+    """Set creation time on Windows via SetFileTime()."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+        # Convert Unix timestamp → Windows FILETIME (100-ns ticks since 1601-01-01)
+        EPOCH_DIFF  = 116_444_736_000_000_000  # ticks between 1601 and 1970
+        filetime_val = int(timestamp * 10_000_000) + EPOCH_DIFF
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [
+                ('dwLowDateTime',  ctypes.wintypes.DWORD),
+                ('dwHighDateTime', ctypes.wintypes.DWORD),
+            ]
+
+        ft = _FILETIME(
+            dwLowDateTime=filetime_val & 0xFFFF_FFFF,
+            dwHighDateTime=(filetime_val >> 32) & 0xFFFF_FFFF,
+        )
+
+        GENERIC_WRITE        = 0x4000_0000
+        FILE_SHARE_READ      = 0x0000_0001
+        OPEN_EXISTING        = 3
+        FILE_ATTRIBUTE_NORMAL = 0x0000_0080
+
+        handle = kernel32.CreateFileW(
+            str(path), GENERIC_WRITE, FILE_SHARE_READ,
+            None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None,
+        )
+        if handle != ctypes.wintypes.HANDLE(-1).value:
+            kernel32.SetFileTime(handle, ctypes.byref(ft), None, None)
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
 
 
 def _format_summary(results):

@@ -1,5 +1,5 @@
-.env
 apod_images/
+*.part
 __pycache__/
 *.pyc
 .venv/

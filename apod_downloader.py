@@ -11,25 +11,27 @@ Usage:
 Requirements:
     - requests
     - python-dateutil
-    - python-dotenv
+    - pyyaml
     - rich
 """
 
 import os
 import sys
 import json
+import sqlite3
+import threading
 import argparse
 import time
 import concurrent.futures
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import piexif
 import requests
+import yaml
 from dateutil import parser as date_parser
-from dotenv import load_dotenv
 from PIL import Image
 from rich.console import Console
 from rich.progress import (
@@ -42,8 +44,6 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
-
-load_dotenv()
 
 # First APOD was published on this date
 FIRST_APOD_DATE = datetime(1995, 6, 16).date()
@@ -60,6 +60,104 @@ def gsfc_today():
 class APODNotAvailableError(Exception):
     """Raised when the API reports no image is available for the requested date."""
     pass
+
+
+def _get_config_dir() -> Path:
+    """Return the platform-appropriate config directory for apod-downloader."""
+    if sys.platform == 'win32':
+        base = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
+    else:
+        base = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+    config_dir = base / 'apod-downloader'
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir
+
+
+def _load_config() -> dict:
+    """
+    Load configuration from the platform config directory (config.yaml).
+
+    Creates the file with a placeholder api_key if it does not exist.
+    Returns an empty dict on parse errors.
+    """
+    config_path = _get_config_dir() / 'config.yaml'
+    if not config_path.exists():
+        config_path.write_text('api_key: your_api_key_here\n')
+    try:
+        with open(config_path) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+class APODCache:
+    """
+    SQLite-backed cache for APOD API responses.
+
+    Stores JSON-serialised API responses keyed by date string (YYYY-MM-DD).
+    The database lives alongside config.yaml in the platform config directory.
+    Thread-safe for concurrent reads; writes are serialised through a single
+    connection opened in check_same_thread=False mode with WAL journal.
+    """
+
+    def __init__(self, db_path: Path):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS apod_cache (
+                date       TEXT PRIMARY KEY,
+                data       TEXT NOT NULL,
+                cached_at  TEXT NOT NULL
+            )
+        """)
+        self._conn.commit()
+
+    def get(self, date: str) -> dict | None:
+        """Return cached APOD data for *date*, or None if not cached."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM apod_cache WHERE date = ?", (date,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def get_range(self, start: str, end: str) -> dict[str, dict]:
+        """
+        Return all cached entries in the date range [start, end] (inclusive).
+
+        Returns a dict mapping date string → APOD data dict.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT date, data FROM apod_cache WHERE date BETWEEN ? AND ?",
+                (start, end)
+            ).fetchall()
+        return {row[0]: json.loads(row[1]) for row in rows}
+
+    def put(self, date: str, data: dict) -> None:
+        """Insert or replace a single entry."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO apod_cache (date, data, cached_at) VALUES (?, ?, ?)",
+                (date, json.dumps(data), now)
+            )
+            self._conn.commit()
+
+    def put_many(self, entries: list[dict]) -> None:
+        """Insert or replace a batch of APOD entries."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO apod_cache (date, data, cached_at) VALUES (?, ?, ?)",
+                [(e['date'], json.dumps(e), now) for e in entries if 'date' in e]
+            )
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
 
 
 def _stamp_file_times(path: Path, apod_date_str: str) -> None:
@@ -196,19 +294,33 @@ class APODDownloader:
     BASE_URL = "https://api.nasa.gov/planetary/apod"
 
     def __init__(self, api_key=None, output_dir="apod_images",
-                 max_workers=5, timeout=30, retry_attempts=3, convert_to_png=False):
+                 max_workers=5, timeout=30, retry_attempts=3,
+                 convert_to_png=False, use_cache=True):
         """
         Initialize the APOD Downloader.
 
         Args:
-            api_key (str): NASA API key. Falls back to NASA_API_KEY env var, then DEMO_KEY.
+            api_key (str): NASA API key. Falls back to NASA_API_KEY env var,
+                           then config.yaml, then DEMO_KEY.
             output_dir (str): Directory to save images.
             max_workers (int): Maximum number of concurrent downloads.
             timeout (int): Timeout for requests in seconds.
             retry_attempts (int): Number of retry attempts for failed requests.
             convert_to_png (bool): Convert non-JPEG/PNG images to PNG after download.
+            use_cache (bool): Cache API responses in SQLite to avoid redundant calls.
         """
-        self.api_key = api_key or os.environ.get("NASA_API_KEY", "DEMO_KEY")
+        config = _load_config()
+        configured_key = config.get('api_key', '')
+        # Treat the placeholder value as absent
+        if configured_key == 'your_api_key_here':
+            configured_key = ''
+
+        self.api_key = (
+            api_key
+            or os.environ.get("NASA_API_KEY", "")
+            or configured_key
+            or "DEMO_KEY"
+        )
         self.output_dir = Path(output_dir)
         self.max_workers = max_workers
         self.timeout = timeout
@@ -217,6 +329,10 @@ class APODDownloader:
         self.session = requests.Session()
         self.console = Console()
         self._rate_limit = {'limit': None, 'remaining': None}
+
+        self._cache: APODCache | None = (
+            APODCache(_get_config_dir() / 'cache.db') if use_cache else None
+        )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._clean_stale_parts()
@@ -451,10 +567,19 @@ class APODDownloader:
         safe_title = safe_title.replace(' ', '_')
         filename = self.output_dir / f"{entry.get('date')}_{safe_title}{ext}"
 
+        # When --convert-to-png is active, non-JPEG/PNG files land on disk as .png.
+        # Check for that final path so we don't re-download an already-converted file.
+        _jpeg_exts = {'.jpg', '.jpeg'}
+        _png_exts  = {'.png'}
+        if self.convert_to_png and ext.lower() not in _jpeg_exts | _png_exts:
+            final_filename = filename.with_suffix('.png')
+        else:
+            final_filename = filename
+
         # Short-circuit if already downloaded — no progress task needed
-        if filename.exists():
+        if final_filename.exists():
             result['success'] = True
-            result['filename'] = str(filename)
+            result['filename'] = str(final_filename)
             return result
 
         task_id = None
@@ -637,6 +762,7 @@ class APODDownloader:
                             if not metadata_file.exists():
                                 with open(metadata_file, 'w') as f:
                                     json.dump(entry, f, indent=2)
+                                _stamp_file_times(metadata_file, entry.get('date', ''))
                     except Exception as e:
                         self.console.print(
                             f"[bold red]✗[/bold red] Error on {entry.get('date')}: {e}"
@@ -685,6 +811,9 @@ class APODDownloader:
         """
         Fetch and download a single 100-day chunk of APOD entries.
 
+        Checks the local cache before making an API call. If every date in the
+        range is already cached, the API call is skipped entirely.
+
         Args:
             start_date (str): Start date in YYYY-MM-DD format.
             end_date (str): End date in YYYY-MM-DD format.
@@ -693,6 +822,24 @@ class APODDownloader:
         Returns:
             list: Results of download operations.
         """
+        if self._cache is not None:
+            start_obj = date_parser.parse(start_date).date()
+            end_obj = date_parser.parse(end_date).date()
+            expected = set()
+            d = start_obj
+            while d <= end_obj:
+                expected.add(d.strftime("%Y-%m-%d"))
+                d += timedelta(days=1)
+
+            cached = self._cache.get_range(start_date, end_date)
+            if expected == set(cached.keys()):
+                noun = "entry" if len(cached) == 1 else "entries"
+                self.console.print(
+                    f"[green]✓[/green] [bold]{len(cached)}[/bold] {noun} fetched"
+                    f"  [dim](cached)[/dim]"
+                )
+                return self._download_entries(list(cached.values()), save_metadata)
+
         data = self.get_apod_data(start_date=start_date, end_date=end_date)
 
         if not data:
@@ -708,6 +855,9 @@ class APODDownloader:
             + self._rate_limit_str()
         )
 
+        if self._cache is not None:
+            self._cache.put_many(data)
+
         return self._download_entries(data, save_metadata)
 
     def download_single_date(self, date, save_metadata=True):
@@ -721,17 +871,30 @@ class APODDownloader:
         Returns:
             dict: Result of the download operation.
         """
-        try:
-            data = self.get_apod_data(date=date)
-        except APODNotAvailableError as e:
-            return {'date': date, 'success': False, 'reason': 'not_available', 'detail': str(e)}
+        data = None
+        from_cache = False
 
-        if not data:
-            return {'date': date, 'success': False, 'reason': 'api_error'}
+        if self._cache is not None:
+            cached = self._cache.get(date)
+            if cached is not None:
+                data = cached
+                from_cache = True
 
+        if not from_cache:
+            try:
+                data = self.get_apod_data(date=date)
+            except APODNotAvailableError as e:
+                return {'date': date, 'success': False, 'reason': 'not_available', 'detail': str(e)}
+
+            if not data:
+                return {'date': date, 'success': False, 'reason': 'api_error'}
+
+            if self._cache is not None:
+                self._cache.put(date, data)
+
+        suffix = "  [dim](cached)[/dim]" if from_cache else self._rate_limit_str()
         self.console.print(
-            f"[green]✓[/green] [bold]{data.get('title', date)}[/bold]"
-            + self._rate_limit_str()
+            f"[green]✓[/green] [bold]{data.get('title', date)}[/bold]" + suffix
         )
 
         with self._single_file_progress() as progress:
@@ -742,6 +905,7 @@ class APODDownloader:
             if not metadata_file.exists():
                 with open(metadata_file, 'w') as f:
                     json.dump(data, f, indent=2)
+                _stamp_file_times(metadata_file, data.get('date', ''))
 
         return result
 
@@ -804,6 +968,7 @@ class APODDownloader:
                 if not metadata_file.exists():
                     with open(metadata_file, 'w') as f:
                         json.dump(entry, f, indent=2)
+                    _stamp_file_times(metadata_file, entry.get('date', ''))
             return result
 
         # count > 1: use batch progress
@@ -859,9 +1024,11 @@ def parse_arguments():
                         help='Do not save metadata JSON files')
     parser.add_argument('--convert-to-png', action='store_true',
                         help='Convert non-JPEG/PNG images (GIF, TIFF, WebP, …) to PNG')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='Bypass the local metadata cache and always fetch from the API')
 
     parser.add_argument('--api-key', default=None,
-                        help='NASA API key (overrides NASA_API_KEY env var; default: DEMO_KEY)')
+                        help='NASA API key (overrides config.yaml and NASA_API_KEY env var)')
 
     parser.add_argument('--max-workers', type=int, default=5,
                         help='Maximum number of concurrent downloads (default: 5)')
@@ -884,6 +1051,7 @@ def main():
         timeout=args.timeout,
         retry_attempts=args.retry_attempts,
         convert_to_png=args.convert_to_png,
+        use_cache=not args.no_cache,
     )
 
     console = downloader.console

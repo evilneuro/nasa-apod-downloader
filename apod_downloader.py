@@ -10,15 +10,14 @@ Usage:
 
 Requirements:
     - requests
-    - tqdm
     - python-dateutil
     - python-dotenv
+    - rich
 """
 
 import os
 import sys
 import json
-import random
 import argparse
 import time
 import concurrent.futures
@@ -30,7 +29,17 @@ from zoneinfo import ZoneInfo
 import requests
 from dateutil import parser as date_parser
 from dotenv import load_dotenv
-from tqdm import tqdm
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 
 load_dotenv()
 
@@ -44,6 +53,32 @@ GSFC_TZ = ZoneInfo("America/New_York")
 def gsfc_today():
     """Return the current date at NASA's Goddard Space Flight Center (America/New_York)."""
     return datetime.now(GSFC_TZ).date()
+
+
+class APODNotAvailableError(Exception):
+    """Raised when the API reports no image is available for the requested date."""
+    pass
+
+
+def _format_summary(results):
+    """Return a Rich-formatted download summary for a list of results."""
+    successful = sum(1 for r in results if r['success'])
+    skipped = sum(
+        1 for r in results
+        if not r['success'] and r.get('reason', '').startswith('Skipped:')
+    )
+    failed = len(results) - successful - skipped
+
+    parts = [f"[bold]{successful}[/bold] downloaded"]
+    if skipped:
+        parts.append(f"[dim]{skipped} skipped (non-image)[/dim]")
+    if failed:
+        parts.append(f"[red]{failed} failed[/red]")
+    return (
+        "[green]✓[/green] "
+        + "  ·  ".join(parts)
+        + f"  [dim](of {len(results)} total)[/dim]"
+    )
 
 
 class APODDownloader:
@@ -69,8 +104,57 @@ class APODDownloader:
         self.timeout = timeout
         self.retry_attempts = retry_attempts
         self.session = requests.Session()
+        self.console = Console()
+        self._rate_limit = {'limit': None, 'remaining': None}
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._clean_stale_parts()
+
+    # ------------------------------------------------------------------
+    # Startup helpers
+    # ------------------------------------------------------------------
+
+    def _clean_stale_parts(self):
+        """Remove any .part files left behind by previously interrupted downloads."""
+        stale = list(self.output_dir.glob('*.part'))
+        for f in stale:
+            f.unlink(missing_ok=True)
+        if stale:
+            self.console.print(
+                f"[dim]Cleaned up {len(stale)} stale .part "
+                f"{'file' if len(stale) == 1 else 'files'} from a previous run.[/dim]"
+            )
+
+    # ------------------------------------------------------------------
+    # Rate limit helpers
+    # ------------------------------------------------------------------
+
+    def _update_rate_limit(self, response):
+        """Cache X-RateLimit-Limit / X-RateLimit-Remaining from an API response."""
+        limit = response.headers.get('X-RateLimit-Limit')
+        remaining = response.headers.get('X-RateLimit-Remaining')
+        if limit is not None:
+            self._rate_limit['limit'] = int(limit)
+        if remaining is not None:
+            self._rate_limit['remaining'] = int(remaining)
+
+    def _rate_limit_str(self):
+        """Return a Rich-formatted rate limit badge, or empty string if not yet known."""
+        if self._rate_limit['limit'] is None:
+            return ""
+        remaining = self._rate_limit['remaining']
+        limit = self._rate_limit['limit']
+        if remaining > limit * 0.5:
+            color = "green"
+        elif remaining > limit * 0.1:
+            color = "yellow"
+        else:
+            color = "red"
+        return f"  [dim]API: [{color}]{remaining}[/{color}]/{limit} calls remaining[/dim]"
+
+    # ------------------------------------------------------------------
+    # API fetch
+    # ------------------------------------------------------------------
 
     def get_apod_data(self, date=None, start_date=None, end_date=None, count=None):
         """
@@ -84,6 +168,9 @@ class APODDownloader:
 
         Returns:
             dict or list: APOD data for the requested date(s).
+
+        Raises:
+            APODNotAvailableError: If the API reports no image exists for the date.
         """
         params = {'api_key': self.api_key}
 
@@ -95,37 +182,75 @@ class APODDownloader:
         elif count:
             params['count'] = count
 
-        for attempt in range(self.retry_attempts):
-            try:
-                response = self.session.get(
-                    self.BASE_URL,
-                    params=params,
-                    timeout=self.timeout
-                )
+        if date:
+            desc = f"Fetching APOD data for [bold]{date}[/bold]"
+        elif start_date:
+            desc = f"Fetching APOD data [bold]{start_date}[/bold] → [bold]{end_date}[/bold]"
+        elif count:
+            noun = "entry" if count == 1 else "entries"
+            desc = f"Fetching [bold]{count}[/bold] random APOD {noun}"
+        else:
+            desc = "Fetching APOD data"
 
-                if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 60))
-                    print(f"Rate limited. Waiting {retry_after}s before retrying...")
-                    time.sleep(retry_after)
-                    continue
+        with self.console.status(f"[cyan]{desc}...[/cyan]") as status:
+            for attempt in range(self.retry_attempts):
+                try:
+                    response = self.session.get(
+                        self.BASE_URL, params=params, timeout=self.timeout
+                    )
 
-                response.raise_for_status()
-                return response.json()
-            except requests.exceptions.RequestException as e:
-                if attempt == self.retry_attempts - 1:
-                    print(f"Failed to fetch APOD data after {self.retry_attempts} attempts: {e}")
-                    return None
-                wait = 2 ** attempt
-                print(f"Attempt {attempt + 1} failed, retrying in {wait}s...")
-                time.sleep(wait)
+                    if response.status_code == 429:
+                        retry_after = int(response.headers.get('Retry-After', 60))
+                        status.update(
+                            f"[yellow]{desc} — rate limited, "
+                            f"waiting {retry_after}s before retrying...[/yellow]"
+                        )
+                        time.sleep(retry_after)
+                        status.update(f"[cyan]{desc}...[/cyan]")
+                        continue
 
-    def download_image(self, url, filename):
+                    # 400 means the date genuinely has no image — don't retry
+                    if response.status_code == 400:
+                        msg = response.json().get('msg', 'No data available for this date')
+                        raise APODNotAvailableError(msg)
+
+                    response.raise_for_status()
+                    self._update_rate_limit(response)
+                    return response.json()
+
+                except APODNotAvailableError:
+                    raise  # propagate immediately, no retry
+
+                except requests.exceptions.RequestException as e:
+                    if attempt == self.retry_attempts - 1:
+                        self.console.print(
+                            f"[bold red]✗[/bold red] Failed after {self.retry_attempts} attempts: {e}"
+                        )
+                        return None
+                    wait = 2 ** attempt
+                    status.update(
+                        f"[yellow]{desc} — attempt {attempt + 1} failed, "
+                        f"retrying in {wait}s...[/yellow]"
+                    )
+                    time.sleep(wait)
+                    status.update(f"[cyan]{desc}...[/cyan]")
+
+    # ------------------------------------------------------------------
+    # Image download
+    # ------------------------------------------------------------------
+
+    def download_image(self, url, filename, progress=None, task_id=None):
         """
         Download an image from a URL and save it to a file.
+
+        Writes to a .part staging file and renames to the final path only on
+        success, so an interrupted download is never mistaken for a complete one.
 
         Args:
             url (str): URL of the image to download.
             filename (Path): Path to save the image.
+            progress (Progress, optional): Rich Progress instance for byte tracking.
+            task_id: Task ID within the Progress instance.
 
         Returns:
             bool: True if download was successful, False otherwise.
@@ -133,30 +258,49 @@ class APODDownloader:
         if filename.exists():
             return True
 
+        part = filename.with_suffix(filename.suffix + '.part')
+        part.unlink(missing_ok=True)
+
         for attempt in range(self.retry_attempts):
             try:
                 response = self.session.get(url, stream=True, timeout=self.timeout)
                 response.raise_for_status()
 
-                with open(filename, 'wb') as f:
+                total_size = int(response.headers.get('content-length', 0)) or None
+                if progress is not None and task_id is not None:
+                    progress.update(task_id, total=total_size)
+
+                with open(part, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
+                            if progress is not None and task_id is not None:
+                                progress.advance(task_id, len(chunk))
+
+                part.rename(filename)
                 return True
+
             except requests.exceptions.RequestException as e:
+                part.unlink(missing_ok=True)
                 if attempt == self.retry_attempts - 1:
-                    print(f"Failed to download {url} after {self.retry_attempts} attempts: {e}")
+                    self.console.print(
+                        f"[bold red]✗[/bold red] Download failed after "
+                        f"{self.retry_attempts} attempts: {e}"
+                    )
                     return False
                 wait = 2 ** attempt
-                print(f"Attempt {attempt + 1} failed, retrying in {wait}s...")
+                self.console.print(
+                    f"[yellow]Attempt {attempt + 1} failed, retrying in {wait}s...[/yellow]"
+                )
                 time.sleep(wait)
 
-    def process_apod_entry(self, entry):
+    def process_apod_entry(self, entry, image_progress=None):
         """
         Process a single APOD entry and download its image.
 
         Args:
             entry (dict): APOD data entry.
+            image_progress (Progress, optional): Rich Progress for per-file byte tracking.
 
         Returns:
             dict: Result of the download operation.
@@ -168,7 +312,7 @@ class APODDownloader:
         }
 
         if entry.get('media_type') != 'image':
-            result['reason'] = f"Skipped media type: {entry.get('media_type')}"
+            result['reason'] = f"Skipped: {entry.get('media_type')}"
             return result
 
         image_url = entry.get('hdurl') or entry.get('url')
@@ -181,19 +325,112 @@ class APODDownloader:
         if not ext:
             ext = '.jpg'
 
-        safe_title = "".join(c if c.isalnum() or c in ' -_' else '_' for c in entry.get('title', ''))
+        safe_title = "".join(
+            c if c.isalnum() or c in ' -_' else '_'
+            for c in entry.get('title', '')
+        )
         safe_title = safe_title.replace(' ', '_')
         filename = self.output_dir / f"{entry.get('date')}_{safe_title}{ext}"
 
-        success = self.download_image(image_url, filename)
-        result['success'] = success
+        # Short-circuit if already downloaded — no progress task needed
+        if filename.exists():
+            result['success'] = True
+            result['filename'] = str(filename)
+            return result
 
+        task_id = None
+        if image_progress is not None:
+            task_id = image_progress.add_task(filename.name, total=None)
+
+        success = self.download_image(image_url, filename, image_progress, task_id)
+
+        if image_progress is not None and task_id is not None:
+            image_progress.remove_task(task_id)
+
+        result['success'] = success
         if success:
             result['filename'] = str(filename)
         else:
             result['reason'] = "Download failed"
 
         return result
+
+    # ------------------------------------------------------------------
+    # Progress factories
+    # ------------------------------------------------------------------
+
+    def _single_file_progress(self):
+        """Rich Progress configured for single-file byte-level tracking."""
+        return Progress(
+            SpinnerColumn(),
+            TextColumn("[cyan]{task.description}[/cyan]"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+        )
+
+    # ------------------------------------------------------------------
+    # Download orchestration
+    # ------------------------------------------------------------------
+
+    def _download_entries(self, entries, save_metadata):
+        """
+        Download a list of APOD entries concurrently with a batch progress bar.
+
+        Args:
+            entries (list): List of APOD data dicts.
+            save_metadata (bool): Whether to save metadata as JSON files.
+
+        Returns:
+            list: Results of download operations.
+        """
+        results = []
+
+        with Progress(
+            SpinnerColumn(),
+            MofNCompleteColumn(),
+            BarColumn(),
+            TextColumn("[dim]{task.description}[/dim]"),
+            console=self.console,
+        ) as progress:
+            overall = progress.add_task("", total=len(entries))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_entry = {
+                    executor.submit(self.process_apod_entry, entry): entry
+                    for entry in entries
+                }
+                for future in concurrent.futures.as_completed(future_to_entry):
+                    entry = future_to_entry[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        progress.update(
+                            overall,
+                            advance=1,
+                            description=(
+                                f"{entry.get('date')}  {entry.get('title', '')[:50]}"
+                            ),
+                        )
+                        if save_metadata and result.get('success'):
+                            metadata_file = Path(result['filename']).with_suffix('.json')
+                            with open(metadata_file, 'w') as f:
+                                json.dump(entry, f, indent=2)
+                    except Exception as e:
+                        self.console.print(
+                            f"[bold red]✗[/bold red] Error on {entry.get('date')}: {e}"
+                        )
+                        results.append({
+                            'date': entry.get('date'),
+                            'title': entry.get('title'),
+                            'success': False,
+                            'reason': str(e)
+                        })
+                        progress.update(overall, advance=1)
+
+        return results
 
     def download_date_range(self, start_date, end_date, save_metadata=True):
         """
@@ -227,7 +464,7 @@ class APODDownloader:
 
     def _download_date_chunk(self, start_date, end_date, save_metadata):
         """
-        Download APOD images for a chunk of dates (up to 100 days).
+        Fetch and download a single 100-day chunk of APOD entries.
 
         Args:
             start_date (str): Start date in YYYY-MM-DD format.
@@ -237,44 +474,22 @@ class APODDownloader:
         Returns:
             list: Results of download operations.
         """
-        print(f"Fetching APOD data from {start_date} to {end_date}...")
         data = self.get_apod_data(start_date=start_date, end_date=end_date)
 
         if not data:
-            print("No data returned from API")
+            self.console.print("[bold red]✗[/bold red] No data returned from API")
             return []
 
         if isinstance(data, dict):
             data = [data]
 
-        print(f"Found {len(data)} APOD entries. Starting downloads...")
+        noun = "entry" if len(data) == 1 else "entries"
+        self.console.print(
+            f"[green]✓[/green] [bold]{len(data)}[/bold] {noun} fetched"
+            + self._rate_limit_str()
+        )
 
-        results = []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_entry = {executor.submit(self.process_apod_entry, entry): entry for entry in data}
-
-            for future in tqdm(concurrent.futures.as_completed(future_to_entry), total=len(data), desc="Downloading"):
-                entry = future_to_entry[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-
-                    if save_metadata and result.get('success'):
-                        metadata_file = Path(result['filename']).with_suffix('.json')
-                        with open(metadata_file, 'w') as f:
-                            json.dump(entry, f, indent=2)
-
-                except Exception as e:
-                    print(f"Error processing {entry.get('date')}: {e}")
-                    results.append({
-                        'date': entry.get('date'),
-                        'title': entry.get('title'),
-                        'success': False,
-                        'reason': str(e)
-                    })
-
-        return results
+        return self._download_entries(data, save_metadata)
 
     def download_single_date(self, date, save_metadata=True):
         """
@@ -287,14 +502,21 @@ class APODDownloader:
         Returns:
             dict: Result of the download operation.
         """
-        print(f"Fetching APOD data for {date}...")
-        data = self.get_apod_data(date=date)
+        try:
+            data = self.get_apod_data(date=date)
+        except APODNotAvailableError as e:
+            return {'date': date, 'success': False, 'reason': 'not_available', 'detail': str(e)}
 
         if not data:
-            print("No data returned from API")
-            return {'date': date, 'success': False, 'reason': "No data returned from API"}
+            return {'date': date, 'success': False, 'reason': 'api_error'}
 
-        result = self.process_apod_entry(data)
+        self.console.print(
+            f"[green]✓[/green] [bold]{data.get('title', date)}[/bold]"
+            + self._rate_limit_str()
+        )
+
+        with self._single_file_progress() as progress:
+            result = self.process_apod_entry(data, image_progress=progress)
 
         if save_metadata and result.get('success'):
             metadata_file = Path(result['filename']).with_suffix('.json')
@@ -307,9 +529,9 @@ class APODDownloader:
         """
         Download the latest APOD image.
 
-        Uses NASA/GSFC's local date (America/New_York) since images are published
-        on Eastern Time. If today's image is not yet available, falls back to
-        yesterday's entry.
+        Uses NASA/GSFC's local date (America/New_York). If today's image is not
+        yet available (APODNotAvailableError), falls back to yesterday. Other
+        failures (network errors, API errors) are returned as-is without fallback.
 
         Args:
             save_metadata (bool): Whether to save metadata as JSON files.
@@ -320,44 +542,56 @@ class APODDownloader:
         today = gsfc_today()
         result = self.download_single_date(today.strftime("%Y-%m-%d"), save_metadata)
 
-        if not result['success']:
+        if result.get('reason') == 'not_available':
             yesterday = today - timedelta(days=1)
-            print(
-                f"Note: today's image ({today}, America/New_York) is not yet available — "
-                f"NASA publishes on Eastern Time. Falling back to {yesterday}..."
+            self.console.print(
+                f"[yellow]Today's image ({today}, America/New_York) not yet available — "
+                f"NASA publishes on Eastern Time. Falling back to {yesterday}...[/yellow]"
             )
             result = self.download_single_date(yesterday.strftime("%Y-%m-%d"), save_metadata)
 
         return result
 
-    def download_random(self, save_metadata=True):
+    def download_random(self, count=1, save_metadata=True):
         """
-        Download a single random APOD image using the API's count parameter.
+        Download one or more random APOD images using the API's count parameter.
 
         Args:
+            count (int): Number of random images to download.
             save_metadata (bool): Whether to save metadata as JSON files.
 
         Returns:
-            dict: Result of the download operation.
+            dict: Single result when count=1.
+            list: List of results when count>1.
         """
-        print("Fetching a random APOD entry...")
-        data = self.get_apod_data(count=1)
+        data = self.get_apod_data(count=count)
 
         if not data:
-            print("No data returned from API")
-            return {'success': False, 'reason': "No data returned from API"}
+            return {'success': False, 'reason': 'api_error'} if count == 1 else []
 
-        entry = data[0] if isinstance(data, list) else data
-        print(f"Selected random date: {entry.get('date')}")
+        entries = data if isinstance(data, list) else [data]
 
-        result = self.process_apod_entry(entry)
+        if count == 1:
+            entry = entries[0]
+            self.console.print(
+                f"[green]✓[/green] [bold]{entry.get('date')}[/bold] — {entry.get('title', '')}"
+                + self._rate_limit_str()
+            )
+            with self._single_file_progress() as progress:
+                result = self.process_apod_entry(entry, image_progress=progress)
+            if save_metadata and result.get('success'):
+                metadata_file = Path(result['filename']).with_suffix('.json')
+                with open(metadata_file, 'w') as f:
+                    json.dump(entry, f, indent=2)
+            return result
 
-        if save_metadata and result.get('success'):
-            metadata_file = Path(result['filename']).with_suffix('.json')
-            with open(metadata_file, 'w') as f:
-                json.dump(entry, f, indent=2)
-
-        return result
+        # count > 1: use batch progress
+        noun = "entries" if count > 1 else "entry"
+        self.console.print(
+            f"[green]✓[/green] [bold]{len(entries)}[/bold] random {noun} fetched"
+            + self._rate_limit_str()
+        )
+        return self._download_entries(entries, save_metadata)
 
     def download_all(self, save_metadata=True):
         """
@@ -372,37 +606,46 @@ class APODDownloader:
         today = gsfc_today()
         start = FIRST_APOD_DATE.strftime("%Y-%m-%d")
         end = today.strftime("%Y-%m-%d")
-        print(f"Downloading complete APOD archive from {start} to {end}...")
+        self.console.print(
+            f"[bold]Downloading complete APOD archive[/bold]  "
+            f"[dim]{start}[/dim] → [dim]{end}[/dim]"
+        )
         return self.download_date_range(start, end, save_metadata)
 
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Download NASA Astronomy Picture of the Day (APOD) images.')
+    parser = argparse.ArgumentParser(
+        description='Download NASA Astronomy Picture of the Day (APOD) images.'
+    )
 
-    # Date selection options
     date_group = parser.add_mutually_exclusive_group()
     date_group.add_argument('--date', help='Download image for specific date (YYYY-MM-DD)')
     date_group.add_argument('--start-date', help='Start date for range (YYYY-MM-DD)')
     date_group.add_argument('--latest', action='store_true', help='Download only the latest image')
-    date_group.add_argument('--random', action='store_true', help='Download a random image from the archive')
+    date_group.add_argument('--random', action='store_true', help='Download random image(s)')
     date_group.add_argument('--all', action='store_true', help='Download the complete APOD archive')
 
-    parser.add_argument('--end-date', help='End date for range (YYYY-MM-DD, requires --start-date)')
+    parser.add_argument('--end-date',
+                        help='End date for range (YYYY-MM-DD); defaults to today when omitted)')
     parser.add_argument('--last-days', type=int, help='Download images from the last N days')
+    parser.add_argument('--count', type=int, default=1,
+                        help='Number of random images to download (use with --random, default: 1)')
 
-    # Output options
-    parser.add_argument('--output-dir', default='apod_images', help='Directory to save images (default: apod_images)')
-    parser.add_argument('--no-metadata', action='store_true', help='Do not save metadata JSON files')
+    parser.add_argument('--output-dir', default='apod_images',
+                        help='Directory to save images (default: apod_images)')
+    parser.add_argument('--no-metadata', action='store_true',
+                        help='Do not save metadata JSON files')
 
-    # API options
     parser.add_argument('--api-key', default=None,
                         help='NASA API key (overrides NASA_API_KEY env var; default: DEMO_KEY)')
 
-    # Performance options
-    parser.add_argument('--max-workers', type=int, default=5, help='Maximum number of concurrent downloads (default: 5)')
-    parser.add_argument('--timeout', type=int, default=30, help='Request timeout in seconds (default: 30)')
-    parser.add_argument('--retry-attempts', type=int, default=3, help='Number of retry attempts (default: 3)')
+    parser.add_argument('--max-workers', type=int, default=5,
+                        help='Maximum number of concurrent downloads (default: 5)')
+    parser.add_argument('--timeout', type=int, default=30,
+                        help='Request timeout in seconds (default: 30)')
+    parser.add_argument('--retry-attempts', type=int, default=3,
+                        help='Number of retry attempts (default: 3)')
 
     return parser.parse_args()
 
@@ -419,61 +662,59 @@ def main():
         retry_attempts=args.retry_attempts
     )
 
+    console = downloader.console
     save_metadata = not args.no_metadata
 
     if args.date:
         result = downloader.download_single_date(args.date, save_metadata)
         if result['success']:
-            print(f"Successfully downloaded image for {args.date} to {result['filename']}")
+            console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
         else:
-            print(f"Failed to download image for {args.date}: {result.get('reason')}")
+            console.print(f"[bold red]✗[/bold red] {args.date}: {result.get('reason')}")
 
     elif args.start_date:
-        if not args.end_date:
-            print("Error: --end-date is required when using --start-date")
-            sys.exit(1)
-
-        results = downloader.download_date_range(args.start_date, args.end_date, save_metadata)
-        successful = sum(1 for r in results if r['success'])
-        print(f"\nDownload complete. Successfully downloaded {successful} of {len(results)} images.")
+        end_date = args.end_date or gsfc_today().strftime("%Y-%m-%d")
+        results = downloader.download_date_range(args.start_date, end_date, save_metadata)
+        console.print("\n" + _format_summary(results))
 
     elif args.last_days:
         end_date = gsfc_today()
         start_date = end_date - timedelta(days=args.last_days - 1)
-
         results = downloader.download_date_range(
             start_date.strftime("%Y-%m-%d"),
             end_date.strftime("%Y-%m-%d"),
             save_metadata
         )
-        successful = sum(1 for r in results if r['success'])
-        print(f"\nDownload complete. Successfully downloaded {successful} of {len(results)} images.")
+        console.print("\n" + _format_summary(results))
 
     elif args.latest:
         result = downloader.download_latest(save_metadata)
         if result['success']:
-            print(f"Successfully downloaded latest image to {result['filename']}")
+            console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
         else:
-            print(f"Failed to download latest image: {result.get('reason')}")
+            console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
 
     elif args.random:
-        result = downloader.download_random(save_metadata)
-        if result['success']:
-            print(f"Successfully downloaded random image from {result.get('date')} to {result['filename']}")
+        if args.count > 1:
+            results = downloader.download_random(count=args.count, save_metadata=save_metadata)
+            console.print("\n" + _format_summary(results))
         else:
-            print(f"Failed to download random image: {result.get('reason')}")
+            result = downloader.download_random(count=1, save_metadata=save_metadata)
+            if result['success']:
+                console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
+            else:
+                console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
 
     elif getattr(args, 'all', False):
         results = downloader.download_all(save_metadata)
-        successful = sum(1 for r in results if r['success'])
-        print(f"\nDownload complete. Successfully downloaded {successful} of {len(results)} images.")
+        console.print("\n" + _format_summary(results))
 
     else:
         result = downloader.download_latest(save_metadata)
         if result['success']:
-            print(f"Successfully downloaded latest image to {result['filename']}")
+            console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
         else:
-            print(f"Failed to download latest image: {result.get('reason')}")
+            console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
 
 
 if __name__ == "__main__":

@@ -89,7 +89,7 @@ class APODDownloader:
     BASE_URL = "https://api.nasa.gov/planetary/apod"
 
     def __init__(self, api_key=None, output_dir="apod_images",
-                 max_workers=5, timeout=30, retry_attempts=3):
+                 max_workers=5, timeout=30, retry_attempts=3, convert_to_png=False):
         """
         Initialize the APOD Downloader.
 
@@ -99,12 +99,14 @@ class APODDownloader:
             max_workers (int): Maximum number of concurrent downloads.
             timeout (int): Timeout for requests in seconds.
             retry_attempts (int): Number of retry attempts for failed requests.
+            convert_to_png (bool): Convert non-JPEG/PNG images to PNG after download.
         """
         self.api_key = api_key or os.environ.get("NASA_API_KEY", "DEMO_KEY")
         self.output_dir = Path(output_dir)
         self.max_workers = max_workers
         self.timeout = timeout
         self.retry_attempts = retry_attempts
+        self.convert_to_png = convert_to_png
         self.session = requests.Session()
         self.console = Console()
         self._rate_limit = {'limit': None, 'remaining': None}
@@ -408,7 +410,7 @@ class APODDownloader:
         fmt = img.format  # 'JPEG', 'PNG', 'GIF', 'TIFF', 'WEBP', …
         apod_dt = datetime.strptime(apod_date_str, "%Y-%m-%d")
         exif_date = apod_dt.strftime("%Y:%m:%d 00:00:00").encode()
-        needs_conversion = fmt not in ('JPEG', 'PNG')
+        needs_conversion = self.convert_to_png and fmt not in ('JPEG', 'PNG')
         final_path = filename.with_suffix('.png') if needs_conversion else filename
 
         # For JPEG, preserve any existing EXIF (camera data, etc.) and only
@@ -735,6 +737,8 @@ def parse_arguments():
                         help='Directory to save images (default: apod_images)')
     parser.add_argument('--no-metadata', action='store_true',
                         help='Do not save metadata JSON files')
+    parser.add_argument('--convert-to-png', action='store_true',
+                        help='Convert non-JPEG/PNG images (GIF, TIFF, WebP, …) to PNG')
 
     parser.add_argument('--api-key', default=None,
                         help='NASA API key (overrides NASA_API_KEY env var; default: DEMO_KEY)')
@@ -758,7 +762,8 @@ def main():
         output_dir=args.output_dir,
         max_workers=args.max_workers,
         timeout=args.timeout,
-        retry_attempts=args.retry_attempts
+        retry_attempts=args.retry_attempts,
+        convert_to_png=args.convert_to_png,
     )
 
     console = downloader.console

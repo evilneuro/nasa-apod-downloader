@@ -1,21 +1,26 @@
 # NASA APOD Image Downloader
 
-A Python script to download images from NASA's Astronomy Picture of the Day (APOD) website with configurable options.
+A Python script to download images from NASA's Astronomy Picture of the Day (APOD) archive, with a rich terminal UI, local metadata caching, EXIF date stamping, and full archive support.
 
-## Description
+## Features
 
-This tool allows you to download high-quality astronomy images from NASA's popular APOD service. It supports downloading images for specific dates, date ranges, the most recent images, or even random images from the archive.
+- Download a single date, a date range, the latest image, random images, or the complete archive
+- Concurrent downloads with a live progress bar
+- SQLite metadata cache — skips API calls for dates already fetched, making repeat or `--all` runs fast
+- EXIF date metadata stamped to match the APOD publication date (not the download date)
+- File system timestamps (created, modified) set to the APOD publication date
+- Non-JPEG/PNG images optionally converted to PNG (`--convert-to-png`)
+- Atomic `.part` file staging — interrupted downloads never leave corrupt files
+- Live API rate limit display after every fetch
+- `--status` flag to check remaining API quota without downloading anything
+- `--cache-info` flag to inspect local cache coverage
+- API key stored in `~/.config/apod-downloader/config.yaml` (not in the project directory)
+- API key redacted from all error output
 
-Features:
+## Requirements
 
-- Download images for a specific date
-- Download images for a range of dates
-- Download images from the last N days
-- Download the latest image
-- Download a random image from the archive
-- Concurrent downloads for improved performance
-- Save metadata along with images
-- Configurable output directory and other options
+- Python 3.9+
+- Dependencies listed in `requirements.txt`: `requests`, `python-dateutil`, `pyyaml`, `rich`, `Pillow`, `piexif`
 
 ## Installation
 
@@ -26,135 +31,152 @@ Features:
    cd apod-downloader
    ```
 
-2. Install the required packages:
+2. Create and activate a virtual environment (recommended):
+
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate   # Windows: .venv\Scripts\activate
+   ```
+
+3. Install dependencies:
 
    ```bash
    pip install -r requirements.txt
    ```
 
-    Alternatively, you can install the dependencies directly:
+## Configuration
 
-    ```bash
-    pip install requests tqdm python-dateutil
-    ```
+On first run the script creates `~/.config/apod-downloader/config.yaml` with a placeholder API key:
 
-3. Make the script executable (optional, for Unix-based systems):
+```yaml
+api_key: your_api_key_here
+```
 
-   ```bash
-   chmod +x apod_downloader.py
-   ```
+Replace the placeholder with your [NASA API key](https://api.nasa.gov/). The key can also be supplied via the `NASA_API_KEY` environment variable or the `--api-key` flag — these take precedence over the config file. If no key is configured, the script falls back to `DEMO_KEY` (30 requests/hour).
+
+On Linux and other XDG-compliant systems the config directory respects `$XDG_CONFIG_HOME`. On Windows it uses `%APPDATA%`.
 
 ## Usage
 
-### Basic Usage
-
-Download today's APOD image:
+### Download the latest image
 
 ```bash
 python apod_downloader.py
+# or explicitly:
+python apod_downloader.py --latest
 ```
 
-### Command Line Options
-
-```
-usage: apod_downloader.py [-h] [--date DATE | --start-date START_DATE | --latest | --random]
-                         [--end-date END_DATE] [--last-days LAST_DAYS]
-                         [--output-dir OUTPUT_DIR] [--no-metadata]
-                         [--api-key API_KEY] [--max-workers MAX_WORKERS]
-                         [--timeout TIMEOUT] [--retry-attempts RETRY_ATTEMPTS]
-
-Download NASA Astronomy Picture of the Day (APOD) images.
-
-options:
-  -h, --help            show this help message and exit
-  --date DATE           Download image for specific date (YYYY-MM-DD)
-  --start-date START_DATE
-                        Start date for range (YYYY-MM-DD)
-  --latest              Download only the latest image
-  --random              Download a random image from the archive
-  --end-date END_DATE   End date for range (YYYY-MM-DD, requires --start-date)
-  --last-days LAST_DAYS
-                        Download images from the last N days
-  --output-dir OUTPUT_DIR
-                        Directory to save images (default: apod_images)
-  --no-metadata         Do not save metadata JSON files
-  --api-key API_KEY     NASA API key (default: DEMO_KEY)
-  --max-workers MAX_WORKERS
-                        Maximum number of concurrent downloads (default: 5)
-  --timeout TIMEOUT     Request timeout in seconds (default: 30)
-  --retry-attempts RETRY_ATTEMPTS
-                        Number of retry attempts (default: 3)
-```
-
-### Examples
-
-Download image for a specific date:
+### Download a specific date
 
 ```bash
-python apod_downloader.py --date 2023-04-15
+python apod_downloader.py --date 2024-04-08
 ```
 
-Download images for a date range:
+### Download a date range
 
 ```bash
-python apod_downloader.py --start-date 2023-01-01 --end-date 2023-01-31
+python apod_downloader.py --start-date 2024-01-01 --end-date 2024-01-31
 ```
 
-Download images from the last 7 days:
+`--end-date` defaults to today when omitted.
+
+### Download the last N days
 
 ```bash
-python apod_downloader.py --last-days 7
+python apod_downloader.py --last-days 30
 ```
 
-Download a random image from the archive:
+### Download a random image (or several)
 
 ```bash
 python apod_downloader.py --random
+python apod_downloader.py --random --count 10
 ```
 
-Specify a custom output directory:
+### Download the complete archive
 
 ```bash
-python apod_downloader.py --output-dir my_apod_images
+python apod_downloader.py --all
 ```
 
-Download with your own NASA API key:
+Downloads everything from the first APOD (1995-06-16) to today in 100-day batches. Dates already in the local cache skip the API entirely.
+
+### Check API rate limit
 
 ```bash
-python apod_downloader.py --api-key YOUR_API_KEY_HERE
+python apod_downloader.py --status
 ```
 
-Download without saving metadata JSON files:
+Makes a minimal API call and displays current usage with a colour-coded bar. On a registered key (1,000 requests/hour) the output looks like:
 
-```bash
-python apod_downloader.py --no-metadata
+```
+NASA API  ·  used: 42/1000  ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  remaining: 958
 ```
 
-Increase the number of concurrent downloads:
+If the quota is exhausted, the remaining wait time is shown instead.
+
+### Inspect the metadata cache
 
 ```bash
-python apod_downloader.py --start-date 2023-01-01 --end-date 2023-03-31 --max-workers 10
+python apod_downloader.py --cache-info
+```
+
+```
+Cache  ·  11,384 entries  (1995-06-16 → 2026-04-19)  ·  100.0% of full archive
 ```
 
 ## Output
 
-Images are saved in the specified output directory (default: `apod_images/`) with filenames in the format:
+Images are saved in the output directory (default: `apod_images/`) with filenames in the format:
 
 ```
 YYYY-MM-DD_Title_Of_The_Image.ext
 ```
 
-For each image, a JSON metadata file with the same name but `.json` extension is also saved (unless `--no-metadata` is specified).
+Unless `--no-metadata` is specified, a sidecar JSON file with the same stem is also saved:
 
-## NASA API Key
+```
+YYYY-MM-DD_Title_Of_The_Image.json
+```
 
-The script uses NASA's `DEMO_KEY` by default, which has rate limits. For better performance, [register for a free NASA API key](https://api.nasa.gov/) and use it with the `--api-key` option.
+Both the image and JSON file have their file system timestamps (created, modified) set to the APOD publication date.
 
-Rate limits for `DEMO_KEY`:
+## All flags
 
-- Hourly limit: 30 requests per IP address per hour
-- Daily limit: 50 requests per IP address per day
+```
+positional / mode flags (mutually exclusive):
+  --date DATE           Download image for a specific date (YYYY-MM-DD)
+  --start-date DATE     Start of a date range (YYYY-MM-DD)
+  --latest              Download the latest image
+  --random              Download random image(s)
+  --all                 Download the complete APOD archive
+
+date range:
+  --end-date DATE       End of a date range (defaults to today)
+  --last-days N         Download images from the last N days
+  --count N             Number of random images (use with --random, default: 1)
+
+output:
+  --output-dir DIR      Directory to save images (default: apod_images)
+  --no-metadata         Do not save JSON sidecar files
+  --convert-to-png      Convert non-JPEG/PNG images (GIF, TIFF, WebP, …) to PNG
+
+cache / status:
+  --status              Show NASA API rate limit usage and exit
+  --cache-info          Show local metadata cache statistics and exit
+  --no-cache            Bypass the local cache and always fetch from the API
+
+connection:
+  --api-key KEY         NASA API key (overrides config.yaml and NASA_API_KEY env var)
+  --max-workers N       Concurrent download threads (default: 5)
+  --timeout N           Request timeout in seconds (default: 30)
+  --retry-attempts N    Retry attempts on failure (default: 3)
+```
+
+## Caching
+
+API responses are cached in `~/.config/apod-downloader/cache.db` (SQLite, WAL mode). Once a date is cached its metadata is never re-fetched, regardless of how many times `--all` is run. Use `--no-cache` to force a live API call, or `--cache-info` to see current coverage.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for more details.
+This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.

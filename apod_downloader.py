@@ -15,6 +15,7 @@ Requirements:
     - rich
 """
 
+import contextlib
 import os
 import re
 import sys
@@ -34,7 +35,8 @@ import requests
 import yaml
 from dateutil import parser as date_parser
 from PIL import Image
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -398,7 +400,8 @@ class APODDownloader:
     # API fetch
     # ------------------------------------------------------------------
 
-    def get_apod_data(self, date=None, start_date=None, end_date=None, count=None):
+    def get_apod_data(self, date=None, start_date=None, end_date=None, count=None,
+                      silent=False):
         """
         Get APOD data for a specific date, date range, or random entries.
 
@@ -407,6 +410,8 @@ class APODDownloader:
             start_date (str, optional): Start date in YYYY-MM-DD format for a range.
             end_date (str, optional): End date in YYYY-MM-DD format for a range.
             count (int, optional): Number of random entries to return.
+            silent (bool): Suppress the status spinner (use when a Live display is
+                           already active on the console to avoid nesting conflicts).
 
         Returns:
             dict or list: APOD data for the requested date(s).
@@ -434,7 +439,12 @@ class APODDownloader:
         else:
             desc = "Fetching APOD data"
 
-        with self.console.status(f"[cyan]{desc}...[/cyan]") as status:
+        status_cm = (
+            contextlib.nullcontext(None)
+            if silent
+            else self.console.status(f"[cyan]{desc}...[/cyan]")
+        )
+        with status_cm as status:
             for attempt in range(self.retry_attempts):
                 try:
                     response = self.session.get(
@@ -443,12 +453,14 @@ class APODDownloader:
 
                     if response.status_code == 429:
                         retry_after = int(response.headers.get('Retry-After', 60))
-                        status.update(
-                            f"[yellow]{desc} — rate limited, "
-                            f"waiting {retry_after}s before retrying...[/yellow]"
-                        )
+                        if status is not None:
+                            status.update(
+                                f"[yellow]{desc} — rate limited, "
+                                f"waiting {retry_after}s before retrying...[/yellow]"
+                            )
                         time.sleep(retry_after)
-                        status.update(f"[cyan]{desc}...[/cyan]")
+                        if status is not None:
+                            status.update(f"[cyan]{desc}...[/cyan]")
                         continue
 
                     # 400/404: no image for this date — don't retry
@@ -470,12 +482,14 @@ class APODDownloader:
                         )
                         return None
                     wait = 2 ** attempt
-                    status.update(
-                        f"[yellow]{desc} — attempt {attempt + 1} failed, "
-                        f"retrying in {wait}s...[/yellow]"
-                    )
+                    if status is not None:
+                        status.update(
+                            f"[yellow]{desc} — attempt {attempt + 1} failed, "
+                            f"retrying in {wait}s...[/yellow]"
+                        )
                     time.sleep(wait)
-                    status.update(f"[cyan]{desc}...[/cyan]")
+                    if status is not None:
+                        status.update(f"[cyan]{desc}...[/cyan]")
 
     # ------------------------------------------------------------------
     # Image download
@@ -819,9 +833,11 @@ class APODDownloader:
         """
         Download APOD images for a date range, chunked into 100-day batches.
 
-        A single Progress bar spanning the full date range is created here and
-        shared across all chunks, so the counter always shows a running global
-        total rather than resetting for each 100-day batch.
+        A Live display combining a stats header and a shared Progress bar spans
+        the entire operation. The header shows running totals of entries fetched
+        from the cache, fetched via the API, and failed, updating between chunks.
+        The progress counter shows a running global total rather than resetting
+        for each 100-day batch.
 
         Args:
             start_date (str): Start date in YYYY-MM-DD format.
@@ -836,6 +852,8 @@ class APODDownloader:
         end_date_obj = date_parser.parse(end_date).date()
         total_days = (end_date_obj - start_date_obj).days + 1
 
+        stats: dict[str, int] = {'from_api': 0, 'from_cache': 0, 'failed': 0}
+
         shared_progress = Progress(
             SpinnerColumn(),
             MofNCompleteColumn(),
@@ -844,10 +862,25 @@ class APODDownloader:
             console=self.console,
         )
         shared_task = shared_progress.add_task("", total=total_days)
-        shared_progress.start()
 
-        results = []
-        try:
+        def make_header() -> str:
+            parts: list[str] = []
+            if stats['from_cache']:
+                parts.append(f"[dim]{stats['from_cache']:,} from cache[/dim]")
+            if stats['from_api']:
+                parts.append(f"[bold]{stats['from_api']:,}[/bold] via API")
+            if stats['failed']:
+                parts.append(f"[red]{stats['failed']:,} failed[/red]")
+            if not parts:
+                parts.append("[dim]fetching metadata...[/dim]")
+            rl = self._rate_limit_str().strip()
+            if rl:
+                parts.append(rl)
+            return "  ·  ".join(parts)
+
+        results: list = []
+        with Live(Group(make_header(), shared_progress),
+                  console=self.console, refresh_per_second=4) as live:
             current_start = start_date_obj
             while current_start <= end_date_obj:
                 current_end = min(current_start + timedelta(days=99), end_date_obj)
@@ -858,16 +891,17 @@ class APODDownloader:
                     progress=shared_progress,
                     task_id=shared_task,
                     cache_only=cache_only,
+                    stats=stats,
                 )
                 results.extend(chunk_results)
+                live.update(Group(make_header(), shared_progress))
                 current_start = current_end + timedelta(days=1)
-        finally:
-            shared_progress.stop()
 
         return results
 
     def _download_date_chunk(self, start_date, end_date, save_metadata,
-                             progress=None, task_id=None, cache_only=False):
+                             progress=None, task_id=None, cache_only=False,
+                             stats=None):
         """
         Fetch and download a single 100-day chunk of APOD entries.
 
@@ -881,6 +915,8 @@ class APODDownloader:
             progress (Progress, optional): Shared Progress instance from caller.
             task_id (TaskID, optional): Task within the shared Progress.
             cache_only (bool): Only populate the SQLite cache; skip all downloads.
+            stats (dict, optional): Running-total counters updated in place:
+                ``from_api``, ``from_cache``, ``failed``.
 
         Returns:
             list: Results of download operations (empty when cache_only=True).
@@ -896,11 +932,8 @@ class APODDownloader:
 
             cached = self._cache.get_range(start_date, end_date)
             if expected == set(cached.keys()):
-                noun = "entry" if len(cached) == 1 else "entries"
-                self.console.print(
-                    f"[green]✓[/green] [bold]{len(cached)}[/bold] {noun} fetched"
-                    f"  [dim](cached)[/dim]"
-                )
+                if stats is not None:
+                    stats['from_cache'] += len(cached)
                 if cache_only:
                     if progress is not None and task_id is not None:
                         progress.update(task_id, advance=len(cached))
@@ -909,24 +942,23 @@ class APODDownloader:
                     list(cached.values()), save_metadata, progress, task_id
                 )
 
-        data = self.get_apod_data(start_date=start_date, end_date=end_date)
+        # Use silent=True — this method is called from within a Live context
+        data = self.get_apod_data(start_date=start_date, end_date=end_date, silent=True)
 
         if not data:
+            if stats is not None:
+                stats['failed'] += 1
             self.console.print("[bold red]✗[/bold red] No data returned from API")
             return []
 
         if isinstance(data, dict):
             data = [data]
 
-        noun = "entry" if len(data) == 1 else "entries"
-        self.console.print(
-            f"[green]✓[/green] [bold]{len(data)}[/bold] {noun} fetched"
-            + self._rate_limit_str()
-        )
+        if stats is not None:
+            stats['from_api'] += len(data)
 
         if self._cache is not None:
             self._cache.put_many(data)
-            self.show_cache_info()
 
         if cache_only:
             if progress is not None and task_id is not None:

@@ -1,0 +1,10 @@
+# this should be updated with your NASA API key
+# which you can obtain from https://api.nasa.gov/
+# if this is invalid, we will use DEMO_KEY, which
+# is the default and is very restrictive)
+# 
+# once updated, copy this to
+# ~/.config/apod-downloader/config.yaml
+
+# your NASA API key
+api_key: DEMO_KEY

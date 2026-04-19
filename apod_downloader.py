@@ -998,6 +998,71 @@ class APODDownloader:
         )
         return self.download_date_range(start, end, save_metadata)
 
+    def check_rate_limit(self):
+        """
+        Make a minimal API call to fetch the current rate limit status and display it.
+
+        Requests a single well-known historical date (the first APOD) so the
+        response payload is as small as possible. The cache is deliberately
+        bypassed because we need a live response to get fresh header values.
+
+        If the quota is currently exhausted (429) the remaining wait time is
+        shown instead.
+        """
+        params = {
+            'api_key': self.api_key,
+            'date': FIRST_APOD_DATE.strftime("%Y-%m-%d"),
+        }
+
+        with self.console.status("[cyan]Checking API rate limit...[/cyan]"):
+            try:
+                response = self.session.get(
+                    self.BASE_URL, params=params, timeout=self.timeout
+                )
+            except requests.exceptions.RequestException as e:
+                self.console.print(f"[bold red]✗[/bold red] Request failed: {e}")
+                return
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 0))
+            h, m = divmod(retry_after // 60, 60)
+            wait_str = f"{h}h {m}m" if h else f"{m}m"
+            self.console.print(
+                f"[bold red]Rate limited[/bold red]  "
+                f"[dim]quota exhausted — resets in ~{wait_str} "
+                f"({retry_after:,} seconds)[/dim]"
+            )
+            return
+
+        self._update_rate_limit(response)
+        limit     = self._rate_limit['limit']
+        remaining = self._rate_limit['remaining']
+
+        if limit is None:
+            self.console.print("[yellow]⚠ Rate limit headers not present in response.[/yellow]")
+            return
+
+        used      = limit - remaining
+        pct_used  = used / limit
+        bar_width = 40
+        filled    = round(bar_width * pct_used)
+        empty     = bar_width - filled
+
+        if pct_used < 0.5:
+            bar_color = "green"
+        elif pct_used < 0.9:
+            bar_color = "yellow"
+        else:
+            bar_color = "red"
+
+        bar = f"[{bar_color}]{'█' * filled}[/{bar_color}][dim]{'░' * empty}[/dim]"
+        self.console.print(
+            f"NASA API  ·  "
+            f"used: [bold]{used:,}[/bold]/{limit:,}  "
+            f"{bar}  "
+            f"remaining: [{bar_color}][bold]{remaining:,}[/bold][/{bar_color}]"
+        )
+
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -1011,6 +1076,9 @@ def parse_arguments():
     date_group.add_argument('--latest', action='store_true', help='Download only the latest image')
     date_group.add_argument('--random', action='store_true', help='Download random image(s)')
     date_group.add_argument('--all', action='store_true', help='Download the complete APOD archive')
+
+    parser.add_argument('--status', action='store_true',
+                        help='Show current NASA API rate limit usage and exit')
 
     parser.add_argument('--end-date',
                         help='End date for range (YYYY-MM-DD); defaults to today when omitted)')
@@ -1056,6 +1124,10 @@ def main():
 
     console = downloader.console
     save_metadata = not args.no_metadata
+
+    if args.status:
+        downloader.check_rate_limit()
+        return
 
     if args.date:
         result = downloader.download_single_date(args.date, save_metadata)

@@ -2,6 +2,9 @@
 
 A Python script to download images from NASA's Astronomy Picture of the Day (APOD) archive, with a rich terminal UI, local metadata caching, EXIF date stamping, and full archive support.
 
+> [!WARNING]
+> This repo contains an experiment to fork an existing, unmaintained open source project with a vertical niche, and use Claude Code to make iterated enhancements to fit and function. This code may not work as expected, so please review it biologically before considering forking or using this code further.
+
 ## Features
 
 - Download a single date, a date range, the latest image, random images, or the complete archive

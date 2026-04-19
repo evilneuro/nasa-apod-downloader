@@ -320,8 +320,8 @@ class APODDownloader:
                         status.update(f"[cyan]{desc}...[/cyan]")
                         continue
 
-                    # 400 means the date genuinely has no image — don't retry
-                    if response.status_code == 400:
+                    # 400/404: no image for this date — don't retry
+                    if response.status_code in (400, 404):
                         msg = response.json().get('msg', 'No data available for this date')
                         raise APODNotAvailableError(msg)
 
@@ -375,6 +375,14 @@ class APODDownloader:
         for attempt in range(self.retry_attempts):
             try:
                 response = self.session.get(url, stream=True, timeout=self.timeout)
+
+                if response.status_code == 404:
+                    part.unlink(missing_ok=True)
+                    self.console.print(
+                        f"[yellow]⚠ Image not found (404): {url}[/yellow]"
+                    )
+                    return False
+
                 response.raise_for_status()
 
                 total_size = int(response.headers.get('content-length', 0)) or None
@@ -626,8 +634,9 @@ class APODDownloader:
                         )
                         if save_metadata and result.get('success'):
                             metadata_file = Path(result['filename']).with_suffix('.json')
-                            with open(metadata_file, 'w') as f:
-                                json.dump(entry, f, indent=2)
+                            if not metadata_file.exists():
+                                with open(metadata_file, 'w') as f:
+                                    json.dump(entry, f, indent=2)
                     except Exception as e:
                         self.console.print(
                             f"[bold red]✗[/bold red] Error on {entry.get('date')}: {e}"
@@ -730,8 +739,9 @@ class APODDownloader:
 
         if save_metadata and result.get('success'):
             metadata_file = Path(result['filename']).with_suffix('.json')
-            with open(metadata_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            if not metadata_file.exists():
+                with open(metadata_file, 'w') as f:
+                    json.dump(data, f, indent=2)
 
         return result
 
@@ -791,8 +801,9 @@ class APODDownloader:
                 result = self.process_apod_entry(entry, image_progress=progress)
             if save_metadata and result.get('success'):
                 metadata_file = Path(result['filename']).with_suffix('.json')
-                with open(metadata_file, 'w') as f:
-                    json.dump(entry, f, indent=2)
+                if not metadata_file.exists():
+                    with open(metadata_file, 'w') as f:
+                        json.dump(entry, f, indent=2)
             return result
 
         # count > 1: use batch progress

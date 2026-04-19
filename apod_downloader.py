@@ -733,28 +733,40 @@ class APODDownloader:
     # Download orchestration
     # ------------------------------------------------------------------
 
-    def _download_entries(self, entries, save_metadata):
+    def _download_entries(self, entries, save_metadata, progress=None, task_id=None):
         """
         Download a list of APOD entries concurrently with a batch progress bar.
+
+        When *progress* and *task_id* are provided the caller owns the Progress
+        instance (used for multi-chunk ranges so the counter shows a running
+        global total). When omitted a private Progress is created and managed
+        here (used for single-chunk and random-batch downloads).
 
         Args:
             entries (list): List of APOD data dicts.
             save_metadata (bool): Whether to save metadata as JSON files.
+            progress (Progress, optional): Shared Rich Progress instance.
+            task_id (TaskID, optional): Task within the shared Progress.
 
         Returns:
             list: Results of download operations.
         """
         results = []
+        _own_progress = progress is None
 
-        with Progress(
-            SpinnerColumn(),
-            MofNCompleteColumn(),
-            BarColumn(),
-            TextColumn("[dim]{task.description}[/dim]"),
-            console=self.console,
-        ) as progress:
-            overall = progress.add_task("", total=len(entries))
+        if _own_progress:
+            progress = Progress(
+                SpinnerColumn(),
+                MofNCompleteColumn(),
+                BarColumn(),
+                TextColumn("[dim]{task.description}[/dim]"),
+                console=self.console,
+            )
+            task_id = progress.add_task("", total=len(entries))
+            progress.start()
 
+        assert progress is not None and task_id is not None
+        try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 future_to_entry = {
                     executor.submit(self.process_apod_entry, entry): entry
@@ -766,7 +778,7 @@ class APODDownloader:
                         result = future.result()
                         results.append(result)
                         progress.update(
-                            overall,
+                            task_id,
                             advance=1,
                             description=(
                                 f"{entry.get('date')}  {entry.get('title', '')[:50]}"
@@ -788,13 +800,20 @@ class APODDownloader:
                             'success': False,
                             'reason': str(e)
                         })
-                        progress.update(overall, advance=1)
+                        progress.update(task_id, advance=1)
+        finally:
+            if _own_progress:
+                progress.stop()
 
         return results
 
     def download_date_range(self, start_date, end_date, save_metadata=True):
         """
         Download APOD images for a date range, chunked into 100-day batches.
+
+        A single Progress bar spanning the full date range is created here and
+        shared across all chunks, so the counter always shows a running global
+        total rather than resetting for each 100-day batch.
 
         Args:
             start_date (str): Start date in YYYY-MM-DD format.
@@ -806,23 +825,39 @@ class APODDownloader:
         """
         start_date_obj = date_parser.parse(start_date).date()
         end_date_obj = date_parser.parse(end_date).date()
+        total_days = (end_date_obj - start_date_obj).days + 1
+
+        shared_progress = Progress(
+            SpinnerColumn(),
+            MofNCompleteColumn(),
+            BarColumn(),
+            TextColumn("[dim]{task.description}[/dim]"),
+            console=self.console,
+        )
+        shared_task = shared_progress.add_task("", total=total_days)
+        shared_progress.start()
 
         results = []
-        current_start = start_date_obj
-
-        while current_start <= end_date_obj:
-            current_end = min(current_start + timedelta(days=99), end_date_obj)
-            chunk_results = self._download_date_chunk(
-                current_start.strftime("%Y-%m-%d"),
-                current_end.strftime("%Y-%m-%d"),
-                save_metadata
-            )
-            results.extend(chunk_results)
-            current_start = current_end + timedelta(days=1)
+        try:
+            current_start = start_date_obj
+            while current_start <= end_date_obj:
+                current_end = min(current_start + timedelta(days=99), end_date_obj)
+                chunk_results = self._download_date_chunk(
+                    current_start.strftime("%Y-%m-%d"),
+                    current_end.strftime("%Y-%m-%d"),
+                    save_metadata,
+                    progress=shared_progress,
+                    task_id=shared_task,
+                )
+                results.extend(chunk_results)
+                current_start = current_end + timedelta(days=1)
+        finally:
+            shared_progress.stop()
 
         return results
 
-    def _download_date_chunk(self, start_date, end_date, save_metadata):
+    def _download_date_chunk(self, start_date, end_date, save_metadata,
+                             progress=None, task_id=None):
         """
         Fetch and download a single 100-day chunk of APOD entries.
 
@@ -833,6 +868,8 @@ class APODDownloader:
             start_date (str): Start date in YYYY-MM-DD format.
             end_date (str): End date in YYYY-MM-DD format.
             save_metadata (bool): Whether to save metadata as JSON files.
+            progress (Progress, optional): Shared Progress instance from caller.
+            task_id (TaskID, optional): Task within the shared Progress.
 
         Returns:
             list: Results of download operations.
@@ -853,7 +890,9 @@ class APODDownloader:
                     f"[green]✓[/green] [bold]{len(cached)}[/bold] {noun} fetched"
                     f"  [dim](cached)[/dim]"
                 )
-                return self._download_entries(list(cached.values()), save_metadata)
+                return self._download_entries(
+                    list(cached.values()), save_metadata, progress, task_id
+                )
 
         data = self.get_apod_data(start_date=start_date, end_date=end_date)
 
@@ -874,7 +913,7 @@ class APODDownloader:
             self._cache.put_many(data)
             self.show_cache_info()
 
-        return self._download_entries(data, save_metadata)
+        return self._download_entries(data, save_metadata, progress, task_id)
 
     def download_single_date(self, date, save_metadata=True):
         """

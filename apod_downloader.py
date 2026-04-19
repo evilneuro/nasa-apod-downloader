@@ -155,6 +155,15 @@ class APODCache:
             )
             self._conn.commit()
 
+    def stats(self) -> dict:
+        """Return summary statistics about the cache contents."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), MIN(date), MAX(date) FROM apod_cache"
+            ).fetchone()
+        count, earliest, latest = row
+        return {'count': count or 0, 'earliest': earliest, 'latest': latest}
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -857,6 +866,7 @@ class APODDownloader:
 
         if self._cache is not None:
             self._cache.put_many(data)
+            self.show_cache_info()
 
         return self._download_entries(data, save_metadata)
 
@@ -896,6 +906,8 @@ class APODDownloader:
         self.console.print(
             f"[green]✓[/green] [bold]{data.get('title', date)}[/bold]" + suffix
         )
+        if not from_cache and self._cache is not None:
+            self.show_cache_info()
 
         with self._single_file_progress() as progress:
             result = self.process_apod_entry(data, image_progress=progress)
@@ -1063,6 +1075,39 @@ class APODDownloader:
             f"remaining: [{bar_color}][bold]{remaining:,}[/bold][/{bar_color}]"
         )
 
+    def show_cache_info(self):
+        """Display summary statistics about the local metadata cache."""
+        if self._cache is None:
+            self.console.print("[yellow]Cache is disabled (--no-cache was set).[/yellow]")
+            return
+
+        s = self._cache.stats()
+
+        if s['count'] == 0:
+            self.console.print(
+                f"[dim]Cache is empty.[/dim]  "
+                f"[dim]({_get_config_dir() / 'cache.db'})[/dim]"
+            )
+            return
+
+        # Total days in the full APOD archive up to today
+        total_possible = (gsfc_today() - FIRST_APOD_DATE).days + 1
+        pct = s['count'] / total_possible * 100
+
+        if pct >= 99:
+            coverage_color = "green"
+        elif pct >= 50:
+            coverage_color = "yellow"
+        else:
+            coverage_color = "red"
+
+        self.console.print(
+            f"Cache  ·  "
+            f"[bold]{s['count']:,}[/bold] entries  "
+            f"[dim]({s['earliest']} → {s['latest']})[/dim]  ·  "
+            f"[{coverage_color}]{pct:.1f}%[/{coverage_color}] of full archive"
+        )
+
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -1079,6 +1124,8 @@ def parse_arguments():
 
     parser.add_argument('--status', action='store_true',
                         help='Show current NASA API rate limit usage and exit')
+    parser.add_argument('--cache-info', action='store_true',
+                        help='Show local metadata cache statistics and exit')
 
     parser.add_argument('--end-date',
                         help='End date for range (YYYY-MM-DD); defaults to today when omitted)')
@@ -1127,6 +1174,10 @@ def main():
 
     if args.status:
         downloader.check_rate_limit()
+        return
+
+    if args.cache_info:
+        downloader.show_cache_info()
         return
 
     if args.date:

@@ -16,6 +16,7 @@ Requirements:
 """
 
 import os
+import re
 import sys
 import json
 import sqlite3
@@ -44,6 +45,11 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
+
+def _redact(text) -> str:
+    """Replace the api_key query-string value in *text* with REDACTED."""
+    return re.sub(r'(?i)(api_key=)[^&\s]+', r'\1REDACTED', str(text))
+
 
 # First APOD was published on this date
 FIRST_APOD_DATE = datetime(1995, 6, 16).date()
@@ -460,7 +466,7 @@ class APODDownloader:
                 except requests.exceptions.RequestException as e:
                     if attempt == self.retry_attempts - 1:
                         self.console.print(
-                            f"[bold red]✗[/bold red] Failed after {self.retry_attempts} attempts: {e}"
+                            f"[bold red]✗[/bold red] Failed after {self.retry_attempts} attempts: {_redact(e)}"
                         )
                         return None
                     wait = 2 ** attempt
@@ -529,7 +535,7 @@ class APODDownloader:
                 if attempt == self.retry_attempts - 1:
                     self.console.print(
                         f"[bold red]✗[/bold red] Download failed after "
-                        f"{self.retry_attempts} attempts: {e}"
+                        f"{self.retry_attempts} attempts: {_redact(e)}"
                     )
                     return False
                 wait = 2 ** attempt
@@ -774,7 +780,7 @@ class APODDownloader:
                                 _stamp_file_times(metadata_file, entry.get('date', ''))
                     except Exception as e:
                         self.console.print(
-                            f"[bold red]✗[/bold red] Error on {entry.get('date')}: {e}"
+                            f"[bold red]✗[/bold red] Error on {entry.get('date')}: {_redact(e)}"
                         )
                         results.append({
                             'date': entry.get('date'),
@@ -1032,7 +1038,7 @@ class APODDownloader:
                     self.BASE_URL, params=params, timeout=self.timeout
                 )
             except requests.exceptions.RequestException as e:
-                self.console.print(f"[bold red]✗[/bold red] Request failed: {e}")
+                self.console.print(f"[bold red]✗[/bold red] Request failed: {_redact(e)}")
                 return
 
         if response.status_code == 429:

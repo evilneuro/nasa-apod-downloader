@@ -26,9 +26,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import piexif
 import requests
 from dateutil import parser as date_parser
 from dotenv import load_dotenv
+from PIL import Image
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -347,10 +349,12 @@ class APODDownloader:
         if image_progress is not None and task_id is not None:
             image_progress.remove_task(task_id)
 
-        result['success'] = success
         if success:
+            filename = self._apply_image_metadata(filename, entry.get('date', ''))
+            result['success'] = True
             result['filename'] = str(filename)
         else:
+            result['success'] = False
             result['reason'] = "Download failed"
 
         return result
@@ -370,6 +374,101 @@ class APODDownloader:
             TimeRemainingColumn(),
             console=self.console,
         )
+
+    # ------------------------------------------------------------------
+    # Image post-processing
+    # ------------------------------------------------------------------
+
+    def _apply_image_metadata(self, filename: Path, apod_date_str: str) -> Path:
+        """
+        Ensure the image is JPEG or PNG and carries the APOD publication date
+        in its EXIF metadata.
+
+        Non-JPEG/PNG files (GIF, TIFF, WebP, …) are converted to PNG.
+        For JPEG, EXIF is patched in-place via piexif.insert() to avoid
+        re-encoding and quality loss. For PNG, the file is re-saved with
+        an eXIf chunk. Existing EXIF data is preserved for JPEG; only the
+        date fields are overwritten.
+
+        Args:
+            filename: Path to the successfully downloaded image.
+            apod_date_str: APOD publication date string (YYYY-MM-DD).
+
+        Returns:
+            Path: Final file path (differs from input if format conversion occurred).
+        """
+        try:
+            img = Image.open(filename)
+        except Exception as e:
+            self.console.print(
+                f"[yellow]⚠ Could not open {filename.name} for metadata: {e}[/yellow]"
+            )
+            return filename
+
+        fmt = img.format  # 'JPEG', 'PNG', 'GIF', 'TIFF', 'WEBP', …
+        apod_dt = datetime.strptime(apod_date_str, "%Y-%m-%d")
+        exif_date = apod_dt.strftime("%Y:%m:%d 00:00:00").encode()
+        needs_conversion = fmt not in ('JPEG', 'PNG')
+        final_path = filename.with_suffix('.png') if needs_conversion else filename
+
+        # For JPEG, preserve any existing EXIF (camera data, etc.) and only
+        # overwrite the date fields. For all other formats start fresh.
+        exif_dict: dict = {"0th": {}, "Exif": {}, "GPS": {}, "Interop": {}, "1st": {}}
+        if fmt == 'JPEG':
+            try:
+                raw = img.info.get('exif', b'')
+                if raw:
+                    exif_dict = piexif.load(raw)
+            except Exception:
+                pass  # malformed existing EXIF — fall back to clean dict
+
+        exif_dict.setdefault("0th", {})[piexif.ImageIFD.DateTime] = exif_date
+        exif_dict.setdefault("Exif", {})[piexif.ExifIFD.DateTimeOriginal] = exif_date
+        exif_dict.setdefault("Exif", {})[piexif.ExifIFD.DateTimeDigitized] = exif_date
+
+        try:
+            exif_bytes = piexif.dump(exif_dict)
+        except Exception:
+            # Existing EXIF may contain values piexif can't serialise — retry clean
+            exif_dict = {
+                "0th": {piexif.ImageIFD.DateTime: exif_date},
+                "Exif": {
+                    piexif.ExifIFD.DateTimeOriginal: exif_date,
+                    piexif.ExifIFD.DateTimeDigitized: exif_date,
+                },
+                "GPS": {}, "Interop": {}, "1st": {},
+            }
+            exif_bytes = piexif.dump(exif_dict)
+
+        try:
+            if needs_conversion:
+                # Normalise palette/unusual modes before saving as PNG
+                if img.mode in ('P', 'PA'):
+                    img = img.convert('RGBA')
+                elif img.mode not in ('RGB', 'RGBA', 'L', 'LA', '1'):
+                    img = img.convert('RGB')
+                img.save(str(final_path), 'PNG', exif=exif_bytes)
+                img.close()
+                filename.unlink()
+                self.console.print(
+                    f"[dim]  Converted {filename.name} ({fmt}) → {final_path.name}[/dim]"
+                )
+            elif fmt == 'JPEG':
+                img.close()
+                piexif.insert(exif_bytes, str(filename))  # in-place, no re-encode
+            else:  # PNG
+                img.save(str(final_path), 'PNG', exif=exif_bytes)
+                img.close()
+        except Exception as e:
+            self.console.print(
+                f"[yellow]⚠ Could not write metadata for {filename.name}: {e}[/yellow]"
+            )
+            try:
+                img.close()
+            except Exception:
+                pass
+
+        return final_path
 
     # ------------------------------------------------------------------
     # Download orchestration

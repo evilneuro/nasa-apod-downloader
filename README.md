@@ -7,6 +7,7 @@ A Python script to download images from NASA's Astronomy Picture of the Day (APO
 - Download a single date, a date range, the latest image, random images, or the complete archive
 - Concurrent downloads with a live progress bar
 - SQLite metadata cache — skips API calls for dates already fetched, making repeat or `--all` runs fast
+- `--cache-only` mode to pre-warm the metadata cache without downloading any images
 - EXIF date metadata stamped to match the APOD publication date (not the download date)
 - File system timestamps (created, modified) set to the APOD publication date
 - Non-JPEG/PNG images optionally converted to PNG (`--convert-to-png`)
@@ -101,6 +102,16 @@ python apod_downloader.py --all
 
 Downloads everything from the first APOD (1995-06-16) to today in 100-day batches. Dates already in the local cache skip the API entirely.
 
+### Pre-warm the metadata cache
+
+```bash
+python apod_downloader.py --all --cache-only
+```
+
+Fetches and caches API metadata for the entire archive without downloading any images or writing JSON sidecar files. Useful before a first `--all` run: the ~11,000 entries fit in around 120 API calls, well within an hour's quota. Any subsequent `--all` will then skip all API calls and go straight to image downloads.
+
+`--cache-only` works with any date selection flag (`--date`, `--start-date`, `--last-days`, `--latest`).
+
 ### Check API rate limit
 
 ```bash
@@ -164,6 +175,7 @@ output:
 cache / status:
   --status              Show NASA API rate limit usage and exit
   --cache-info          Show local metadata cache statistics and exit
+  --cache-only          Populate the metadata cache without downloading any images
   --no-cache            Bypass the local cache and always fetch from the API
 
 connection:
@@ -175,7 +187,7 @@ connection:
 
 ## Caching
 
-API responses are cached in `~/.config/apod-downloader/cache.db` (SQLite, WAL mode). Once a date is cached its metadata is never re-fetched, regardless of how many times `--all` is run. Use `--no-cache` to force a live API call, or `--cache-info` to see current coverage.
+API responses are cached in `~/.config/apod-downloader/cache.db` (SQLite, WAL mode). Once a date is cached its metadata is never re-fetched, regardless of how many times `--all` is run. Use `--cache-only` to pre-warm the cache without downloading images, `--no-cache` to force a live API call, or `--cache-info` to see current coverage.
 
 ## License
 

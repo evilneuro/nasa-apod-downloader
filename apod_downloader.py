@@ -814,7 +814,8 @@ class APODDownloader:
 
         return results
 
-    def download_date_range(self, start_date, end_date, save_metadata=True):
+    def download_date_range(self, start_date, end_date, save_metadata=True,
+                            cache_only=False):
         """
         Download APOD images for a date range, chunked into 100-day batches.
 
@@ -826,9 +827,10 @@ class APODDownloader:
             start_date (str): Start date in YYYY-MM-DD format.
             end_date (str): End date in YYYY-MM-DD format.
             save_metadata (bool): Whether to save metadata as JSON files.
+            cache_only (bool): Only populate the SQLite cache; skip all downloads.
 
         Returns:
-            list: Results of download operations.
+            list: Results of download operations (empty when cache_only=True).
         """
         start_date_obj = date_parser.parse(start_date).date()
         end_date_obj = date_parser.parse(end_date).date()
@@ -855,6 +857,7 @@ class APODDownloader:
                     save_metadata,
                     progress=shared_progress,
                     task_id=shared_task,
+                    cache_only=cache_only,
                 )
                 results.extend(chunk_results)
                 current_start = current_end + timedelta(days=1)
@@ -864,7 +867,7 @@ class APODDownloader:
         return results
 
     def _download_date_chunk(self, start_date, end_date, save_metadata,
-                             progress=None, task_id=None):
+                             progress=None, task_id=None, cache_only=False):
         """
         Fetch and download a single 100-day chunk of APOD entries.
 
@@ -877,9 +880,10 @@ class APODDownloader:
             save_metadata (bool): Whether to save metadata as JSON files.
             progress (Progress, optional): Shared Progress instance from caller.
             task_id (TaskID, optional): Task within the shared Progress.
+            cache_only (bool): Only populate the SQLite cache; skip all downloads.
 
         Returns:
-            list: Results of download operations.
+            list: Results of download operations (empty when cache_only=True).
         """
         if self._cache is not None:
             start_obj = date_parser.parse(start_date).date()
@@ -897,6 +901,10 @@ class APODDownloader:
                     f"[green]✓[/green] [bold]{len(cached)}[/bold] {noun} fetched"
                     f"  [dim](cached)[/dim]"
                 )
+                if cache_only:
+                    if progress is not None and task_id is not None:
+                        progress.update(task_id, advance=len(cached))
+                    return []
                 return self._download_entries(
                     list(cached.values()), save_metadata, progress, task_id
                 )
@@ -920,15 +928,21 @@ class APODDownloader:
             self._cache.put_many(data)
             self.show_cache_info()
 
+        if cache_only:
+            if progress is not None and task_id is not None:
+                progress.update(task_id, advance=len(data))
+            return []
+
         return self._download_entries(data, save_metadata, progress, task_id)
 
-    def download_single_date(self, date, save_metadata=True):
+    def download_single_date(self, date, save_metadata=True, cache_only=False):
         """
         Download APOD image for a single date.
 
         Args:
             date (str): Date in YYYY-MM-DD format.
             save_metadata (bool): Whether to save metadata as JSON files.
+            cache_only (bool): Only populate the SQLite cache; skip all downloads.
 
         Returns:
             dict: Result of the download operation.
@@ -962,6 +976,9 @@ class APODDownloader:
         if not from_cache and self._cache is not None:
             self.show_cache_info()
 
+        if cache_only:
+            return {'date': date, 'title': data.get('title'), 'success': True, 'cached': True}
+
         with self._single_file_progress() as progress:
             result = self.process_apod_entry(data, image_progress=progress)
 
@@ -974,7 +991,7 @@ class APODDownloader:
 
         return result
 
-    def download_latest(self, save_metadata=True):
+    def download_latest(self, save_metadata=True, cache_only=False):
         """
         Download the latest APOD image.
 
@@ -984,12 +1001,14 @@ class APODDownloader:
 
         Args:
             save_metadata (bool): Whether to save metadata as JSON files.
+            cache_only (bool): Only populate the SQLite cache; skip all downloads.
 
         Returns:
             dict: Result of the download operation.
         """
         today = gsfc_today()
-        result = self.download_single_date(today.strftime("%Y-%m-%d"), save_metadata)
+        result = self.download_single_date(today.strftime("%Y-%m-%d"), save_metadata,
+                                           cache_only=cache_only)
 
         if result.get('reason') == 'not_available':
             yesterday = today - timedelta(days=1)
@@ -997,7 +1016,8 @@ class APODDownloader:
                 f"[yellow]Today's image ({today}, America/New_York) not yet available — "
                 f"NASA publishes on Eastern Time. Falling back to {yesterday}...[/yellow]"
             )
-            result = self.download_single_date(yesterday.strftime("%Y-%m-%d"), save_metadata)
+            result = self.download_single_date(yesterday.strftime("%Y-%m-%d"), save_metadata,
+                                               cache_only=cache_only)
 
         return result
 
@@ -1044,24 +1064,26 @@ class APODDownloader:
         )
         return self._download_entries(entries, save_metadata)
 
-    def download_all(self, save_metadata=True):
+    def download_all(self, save_metadata=True, cache_only=False):
         """
         Download the complete APOD archive from the first entry to today.
 
         Args:
             save_metadata (bool): Whether to save metadata as JSON files.
+            cache_only (bool): Only populate the SQLite cache; skip all downloads.
 
         Returns:
-            list: Results of download operations.
+            list: Results of download operations (empty when cache_only=True).
         """
         today = gsfc_today()
         start = FIRST_APOD_DATE.strftime("%Y-%m-%d")
         end = today.strftime("%Y-%m-%d")
+        verb = "Caching metadata for" if cache_only else "Downloading"
         self.console.print(
-            f"[bold]Downloading complete APOD archive[/bold]  "
+            f"[bold]{verb} complete APOD archive[/bold]  "
             f"[dim]{start}[/dim] → [dim]{end}[/dim]"
         )
-        return self.download_date_range(start, end, save_metadata)
+        return self.download_date_range(start, end, save_metadata, cache_only=cache_only)
 
     def check_rate_limit(self):
         """
@@ -1194,6 +1216,8 @@ def parse_arguments():
                         help='Convert non-JPEG/PNG images (GIF, TIFF, WebP, …) to PNG')
     parser.add_argument('--no-cache', action='store_true',
                         help='Bypass the local metadata cache and always fetch from the API')
+    parser.add_argument('--cache-only', action='store_true',
+                        help='Populate the metadata cache without downloading any images')
 
     parser.add_argument('--api-key', default=None,
                         help='NASA API key (overrides config.yaml and NASA_API_KEY env var)')
@@ -1224,6 +1248,7 @@ def main():
 
     console = downloader.console
     save_metadata = not args.no_metadata
+    cache_only = args.cache_only
 
     if args.status:
         downloader.check_rate_limit()
@@ -1233,17 +1258,33 @@ def main():
         downloader.show_cache_info()
         return
 
+    if cache_only and args.no_cache:
+        console.print("[bold red]✗[/bold red] --cache-only and --no-cache are contradictory.")
+        return
+
     if args.date:
-        result = downloader.download_single_date(args.date, save_metadata)
-        if result['success']:
-            console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
+        result = downloader.download_single_date(args.date, save_metadata,
+                                                 cache_only=cache_only)
+        if cache_only:
+            if result['success']:
+                console.print(f"[green]✓[/green] Metadata cached for [bold]{args.date}[/bold]")
+            else:
+                console.print(f"[bold red]✗[/bold red] {args.date}: {result.get('reason')}")
         else:
-            console.print(f"[bold red]✗[/bold red] {args.date}: {result.get('reason')}")
+            if result['success']:
+                console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
+            else:
+                console.print(f"[bold red]✗[/bold red] {args.date}: {result.get('reason')}")
 
     elif args.start_date:
         end_date = args.end_date or gsfc_today().strftime("%Y-%m-%d")
-        results = downloader.download_date_range(args.start_date, end_date, save_metadata)
-        console.print("\n" + _format_summary(results))
+        results = downloader.download_date_range(args.start_date, end_date, save_metadata,
+                                                 cache_only=cache_only)
+        if cache_only:
+            console.print()
+            downloader.show_cache_info()
+        else:
+            console.print("\n" + _format_summary(results))
 
     elif args.last_days:
         end_date = gsfc_today()
@@ -1251,16 +1292,27 @@ def main():
         results = downloader.download_date_range(
             start_date.strftime("%Y-%m-%d"),
             end_date.strftime("%Y-%m-%d"),
-            save_metadata
+            save_metadata,
+            cache_only=cache_only,
         )
-        console.print("\n" + _format_summary(results))
+        if cache_only:
+            console.print()
+            downloader.show_cache_info()
+        else:
+            console.print("\n" + _format_summary(results))
 
     elif args.latest:
-        result = downloader.download_latest(save_metadata)
-        if result['success']:
-            console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
+        result = downloader.download_latest(save_metadata, cache_only=cache_only)
+        if cache_only:
+            if result['success']:
+                console.print(f"[green]✓[/green] Metadata cached for [bold]{result['date']}[/bold]")
+            else:
+                console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
         else:
-            console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
+            if result['success']:
+                console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
+            else:
+                console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
 
     elif args.random:
         if args.count > 1:
@@ -1274,15 +1326,25 @@ def main():
                 console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
 
     elif getattr(args, 'all', False):
-        results = downloader.download_all(save_metadata)
-        console.print("\n" + _format_summary(results))
+        results = downloader.download_all(save_metadata, cache_only=cache_only)
+        if cache_only:
+            console.print()
+            downloader.show_cache_info()
+        else:
+            console.print("\n" + _format_summary(results))
 
     else:
-        result = downloader.download_latest(save_metadata)
-        if result['success']:
-            console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
+        result = downloader.download_latest(save_metadata, cache_only=cache_only)
+        if cache_only:
+            if result['success']:
+                console.print(f"[green]✓[/green] Metadata cached for [bold]{result['date']}[/bold]")
+            else:
+                console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
         else:
-            console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
+            if result['success']:
+                console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
+            else:
+                console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
 
 
 if __name__ == "__main__":

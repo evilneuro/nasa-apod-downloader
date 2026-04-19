@@ -713,9 +713,16 @@ class APODDownloader:
             elif fmt == 'JPEG':
                 img.close()
                 piexif.insert(exif_bytes, str(filename))  # in-place, no re-encode
-            else:  # PNG
+            elif fmt == 'PNG':
                 img.save(str(final_path), 'PNG', exif=exif_bytes)
                 img.close()
+            else:
+                # GIF, TIFF, WebP, etc. without --convert-to-png: leave the file
+                # untouched. These formats don't support EXIF natively and
+                # re-saving through Pillow would destroy animation frames.
+                img.close()
+                _stamp_file_times(final_path, apod_date_str)
+                return final_path
         except Exception as e:
             self.console.print(
                 f"[yellow]⚠ Could not write metadata for {filename.name}: {e}[/yellow]"

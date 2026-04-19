@@ -21,6 +21,8 @@ A Python script to download images from NASA's Astronomy Picture of the Day (APO
 - API key stored in `~/.config/apod-downloader/config.yaml` (not in the project directory)
 - API key redacted from all error output
 
+![Screenshot showing usage and output](docs/screengrab.png)
+
 ## Requirements
 
 - Python 3.9+

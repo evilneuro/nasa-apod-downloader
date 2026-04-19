@@ -343,7 +343,7 @@ class APODDownloader:
         self.convert_to_png = convert_to_png
         self.session = requests.Session()
         self.console = Console()
-        self._rate_limit = {'limit': None, 'remaining': None}
+        self._rate_limit: dict[str, int | None] = {'limit': None, 'remaining': None}
 
         self._cache: APODCache | None = (
             APODCache(_get_config_dir() / 'cache.db') if use_cache else None
@@ -382,7 +382,7 @@ class APODDownloader:
 
     def _rate_limit_str(self):
         """Return a Rich-formatted rate limit badge, or empty string if not yet known."""
-        if self._rate_limit['limit'] is None:
+        if self._rate_limit['limit'] is None or self._rate_limit['remaining'] is None:
             return ""
         remaining = self._rate_limit['remaining']
         limit = self._rate_limit['limit']
@@ -908,6 +908,7 @@ class APODDownloader:
             if self._cache is not None:
                 self._cache.put(date, data)
 
+        assert data is not None  # always set: either from cache or from API above
         suffix = "  [dim](cached)[/dim]" if from_cache else self._rate_limit_str()
         self.console.print(
             f"[green]✓[/green] [bold]{data.get('title', date)}[/bold]" + suffix
@@ -1056,7 +1057,7 @@ class APODDownloader:
         limit     = self._rate_limit['limit']
         remaining = self._rate_limit['remaining']
 
-        if limit is None:
+        if limit is None or remaining is None:
             self.console.print("[yellow]⚠ Rate limit headers not present in response.[/yellow]")
             return
 
@@ -1221,9 +1222,9 @@ def main():
             console.print("\n" + _format_summary(results))
         else:
             result = downloader.download_random(count=1, save_metadata=save_metadata)
-            if result['success']:
+            if isinstance(result, dict) and result['success']:
                 console.print(f"[green]✓[/green] Saved to [bold]{result['filename']}[/bold]")
-            else:
+            elif isinstance(result, dict):
                 console.print(f"[bold red]✗[/bold red] {result.get('reason')}")
 
     elif getattr(args, 'all', False):
